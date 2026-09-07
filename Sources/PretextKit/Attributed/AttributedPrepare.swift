@@ -282,16 +282,27 @@ public func prepareAttributed(
 /// indents are applied. Geometry only: map the line onto the source with
 /// `PreparedAttributedText.utf16Range(of:)` and draw that range yourself.
 ///
-/// A segment wider than `maxWidth` is taken whole and overflows the line;
-/// this walker does not break inside a segment.
+/// A segment wider than `maxWidth` breaks inside itself when the prepare
+/// measured its graphemes — a word-like segment wide enough to ever
+/// overflow a line — so the line ends at the last grapheme that fits and
+/// the next line starts inside the segment; any other segment is taken
+/// whole and overflows.
+///
+/// `tabStopAdvance` overrides the prepare's eight-space tab stop for this
+/// line: a caller laying out a paragraph with its own tab interval passes
+/// it here, so the walk and the drawing agree on where a tab lands.
 public func layoutNextLine(
     _ prepared: PreparedAttributedText,
     start: LayoutCursor,
-    maxWidth: CGFloat
+    maxWidth: CGFloat,
+    tabStopAdvance: CGFloat? = nil
 ) -> LayoutLineRange? {
     guard start.segmentIndex < prepared.segments.count else { return nil }
     var result: LayoutLineRange?
-    walkSingleLine(prepared.core, segments: prepared.segments, start: start, maxWidth: Float(maxWidth)) { line in
+    walkSingleLine(
+        prepared.core, segments: prepared.segments, start: start, maxWidth: Float(maxWidth),
+        tabStopAdvance: tabStopAdvance.map { Float($0) }
+    ) { line in
         result = LayoutLineRange(
             width: CGFloat(line.width),
             start: LayoutCursor(segmentIndex: line.startSegmentIndex, graphemeIndex: line.startGraphemeIndex),

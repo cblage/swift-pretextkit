@@ -213,15 +213,23 @@ private func materializeLineText(
 /// Walk a single line from a given start position.
 /// Internal rather than private: the attributed `layoutNextLine` steps
 /// through prepared attributed text with the same walker.
+///
+/// A segment with measured grapheme widths breaks inside itself when it
+/// is wider than the line: the line ends at the last grapheme that fits
+/// (one at least), and a start cursor inside such a segment weighs only
+/// its remaining graphemes. `tabStopAdvance` overrides the core's when
+/// given.
 func walkSingleLine(
     _ core: PreparedCore,
     segments: [String],
     start: LayoutCursor,
     maxWidth: Float,
+    tabStopAdvance: Float? = nil,
     onLine: (InternalLayoutLine) -> Void
 ) {
     let totalSegments = segments.count
     guard start.segmentIndex < totalSegments else { return }
+    let tabStop = tabStopAdvance ?? core.tabStopAdvance
 
     var lineW: Float = 0
     var hasContent = false
@@ -244,13 +252,45 @@ func walkSingleLine(
             return
         }
 
-        let w = core.widths[i]
+        // A segment entered part-way — the tail of one an earlier line
+        // broke inside — weighs its remaining graphemes alone.
+        var w = core.widths[i]
+        let graphemeStart = i == lineStart ? lineStartGrapheme : 0
+        if graphemeStart > 0, let graphemeWidths = core.breakableWidths[i] {
+            w = graphemeWidths.dropFirst(graphemeStart).reduce(0, +)
+        }
         let advance: Float = kind == .tab
-            ? getTabAdvance(lineW: lineW, tabStopAdvance: core.tabStopAdvance)
+            ? getTabAdvance(lineW: lineW, tabStopAdvance: tabStop)
             : w
 
         if !hasContent {
             if kind.isSimpleCollapsibleSpace { continue }
+            // An overlong segment breaks inside itself: the line ends at
+            // the last grapheme that fits, and the next line starts
+            // there. A segment whose remaining graphemes fit after all
+            // goes whole.
+            if advance > maxWidth + lineFitEpsilon, let graphemeWidths = core.breakableWidths[i] {
+                var fitted: Float = 0
+                var grapheme = graphemeStart
+                while grapheme < graphemeWidths.count {
+                    let graphemeWidth = graphemeWidths[grapheme]
+                    if fitted + graphemeWidth > maxWidth + lineFitEpsilon, grapheme > graphemeStart {
+                        break
+                    }
+                    fitted += graphemeWidth
+                    grapheme += 1
+                }
+                if grapheme < graphemeWidths.count {
+                    onLine(InternalLayoutLine(
+                        startSegmentIndex: lineStart,
+                        startGraphemeIndex: lineStartGrapheme,
+                        endSegmentIndex: i,
+                        endGraphemeIndex: grapheme,
+                        width: fitted
+                    ))
+                    return
+                }
+            }
             lineW = advance
             hasContent = true
             if kind.canBreakAfter {
