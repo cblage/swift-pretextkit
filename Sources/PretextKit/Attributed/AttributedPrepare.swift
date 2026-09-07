@@ -116,6 +116,25 @@ public struct PreparedAttributedText: @unchecked Sendable {
     }
 }
 
+extension PreparedAttributedText {
+    /// The same text at another scale: every width, advance, ascent, and
+    /// descent multiplied by `factor` — pure arithmetic, no measuring — for
+    /// a caller whose fonts scale uniformly, an interface zoom: the breaks
+    /// the scaled text would take, from the prepare it already has.
+    public func scaled(by factor: CGFloat) -> PreparedAttributedText {
+        let f = Float(factor)
+        return PreparedAttributedText(
+            core: core.scaled(by: f),
+            segments: segments,
+            utf16Starts: utf16Starts,
+            utf16Lengths: utf16Lengths,
+            ascents: ascents.map { $0 * f },
+            descents: descents.map { $0 * f },
+            sourceLength: sourceLength
+        )
+    }
+}
+
 /// Segments and measures an attributed string with its own fonts.
 ///
 /// Expensive and one-time per string; safe on any thread. Reflow afterwards

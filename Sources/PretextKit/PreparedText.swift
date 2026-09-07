@@ -36,6 +36,25 @@ struct PreparedCore: @unchecked Sendable {
     /// Hard-break chunk boundaries. Normal text has one chunk covering everything.
     /// Pre-wrap text with `\n` characters splits into multiple chunks.
     let chunks: [PreparedLineChunk]
+
+    /// The same core at another size: every width and advance multiplied by
+    /// `factor` — pure arithmetic, no measuring — for text whose fonts scale
+    /// uniformly. Kinds, chunks, and the fast-path flag are unchanged.
+    func scaled(by factor: Float) -> PreparedCore {
+        PreparedCore(
+            widths: widths.map { $0 * factor },
+            lineEndFitAdvances: lineEndFitAdvances.map { $0 * factor },
+            lineEndPaintAdvances: lineEndPaintAdvances.map { $0 * factor },
+            kinds: kinds,
+            simpleLineWalkFastPath: simpleLineWalkFastPath,
+            breakableWidths: breakableWidths.map { widths in
+                widths.map { ContiguousArray($0.map { $0 * factor }) }
+            },
+            discretionaryHyphenWidth: discretionaryHyphenWidth * factor,
+            tabStopAdvance: tabStopAdvance * factor,
+            chunks: chunks
+        )
+    }
 }
 
 /// A contiguous region between hard breaks.
