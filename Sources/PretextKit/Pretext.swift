@@ -211,7 +211,9 @@ private func materializeLineText(
 }
 
 /// Walk a single line from a given start position.
-private func walkSingleLine(
+/// Internal rather than private: the attributed `layoutNextLine` steps
+/// through prepared attributed text with the same walker.
+func walkSingleLine(
     _ core: PreparedCore,
     segments: [String],
     start: LayoutCursor,

@@ -164,7 +164,9 @@ func analyzeText(
 // MARK: - Build Merged Segmentation
 
 /// Main segmentation pipeline: word segment → classify → merge rules.
-private func buildMergedSegmentation(
+/// Internal rather than private: the attributed prepare runs it on an
+/// un-normalised string so segment offsets map onto the caller's text.
+func buildMergedSegmentation(
     _ normalized: String,
     whiteSpace: WhiteSpaceMode
 ) -> MergedSegmentation {
