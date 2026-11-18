@@ -152,6 +152,17 @@ public func prepareAttributed(
     _ text: NSAttributedString,
     attachmentMetrics: ((Int) -> AttachmentMetrics?)? = nil
 ) -> PreparedAttributedText {
+    prepareAttributed(
+        text, attachmentMetrics: attachmentMetrics,
+        measurer: AttributedSegmentMeasurer(source: text)
+    )
+}
+
+func prepareAttributed(
+    _ text: NSAttributedString,
+    attachmentMetrics: ((Int) -> AttachmentMetrics?)? = nil,
+    measurer makeMeasurer: @autoclosure () -> AttributedSegmentMeasurer
+) -> PreparedAttributedText {
     let length = text.length
     guard length > 0 else {
         return PreparedAttributedText(
@@ -168,7 +179,7 @@ public func prepareAttributed(
     let segmentation = normalizeForAttributed(
         buildMergedSegmentation(text.string, whiteSpace: .preWrap)
     )
-    let measurer = AttributedSegmentMeasurer(source: text)
+    let measurer = makeMeasurer()
     var builder = AttributedSegmentBuilder()
     builder.reserveCapacity(segmentation.count)
 
@@ -201,14 +212,14 @@ public func prepareAttributed(
             )
 
         case .space, .preservedSpace:
-            let metrics = measurer.measure(range)
+            let metrics = measurer.measure(range, text: segmentText)
             builder.push(
                 text: segmentText, range: range, width: metrics.width, fitAdvance: 0, paintAdvance: 0,
                 kind: kind, ascent: metrics.ascent, descent: metrics.descent
             )
 
         case .glue:
-            let metrics = measurer.measure(range)
+            let metrics = measurer.measure(range, text: segmentText)
             builder.push(
                 text: segmentText, range: range, width: metrics.width,
                 fitAdvance: metrics.width, paintAdvance: metrics.width,
@@ -234,7 +245,7 @@ public func prepareAttributed(
                 splitCJKIntoGraphemes(segmentText, start: start, measurer: measurer, builder: &builder)
                 continue
             }
-            let metrics = measurer.measure(range)
+            let metrics = measurer.measure(range, text: segmentText)
             // Per-grapheme widths let an overlong word break inside itself.
             // Measured only for a segment wide enough to ever overflow a
             // line: a CTLine per character across a whole transcript is
@@ -425,7 +436,7 @@ private func splitCJKIntoGraphemes(
     func flush() {
         guard !unitText.isEmpty else { return }
         let range = NSRange(location: unitStart, length: unitText.utf16.count)
-        let metrics = measurer.measure(range)
+        let metrics = measurer.measure(range, text: unitText)
         builder.push(
             text: unitText, range: range, width: metrics.width,
             fitAdvance: metrics.width, paintAdvance: metrics.width,
@@ -527,7 +538,7 @@ private struct AttributedSegmentBuilder {
 /// Measures ranges of one attributed string with the fonts and kerning its
 /// runs carry, through a reused scratch attributed string. One instance per
 /// prepare, used from that thread alone.
-private final class AttributedSegmentMeasurer {
+final class AttributedSegmentMeasurer {
     struct Metrics {
         var width: Float
         var ascent: Float
@@ -540,34 +551,61 @@ private final class AttributedSegmentMeasurer {
     private static let kernKey = NSAttributedString.Key("NSKern")
 
     private let source: NSAttributedString
-    private let scratch: CFMutableAttributedString
+    private let memo: AttributedMeasurementMemo
+    private let makeLine: (CFAttributedString) -> CTLine
+    private lazy var scratch: CFMutableAttributedString =
+        CFAttributedStringCreateMutable(kCFAllocatorDefault, 0)
 
-    init(source: NSAttributedString) {
+    init(
+        source: NSAttributedString, memo: AttributedMeasurementMemo = .current,
+        makeLine: @escaping (CFAttributedString) -> CTLine = CTLineCreateWithAttributedString
+    ) {
         self.source = source
-        self.scratch = CFAttributedStringCreateMutable(kCFAllocatorDefault, 0)
+        self.memo = memo
+        self.makeLine = makeLine
     }
 
     /// The typographic width and metrics of a source range, its runs' fonts
-    /// and kerning applied.
-    func measure(_ range: NSRange) -> Metrics {
-        let sub = source.attributedSubstring(from: range)
-        resetScratch(with: sub.string)
-        sub.enumerateAttributes(in: NSRange(location: 0, length: sub.length), options: []) { attrs, runRange, _ in
-            apply(attrs, to: runRange)
+    /// and kerning applied. The segmenter already holds the text at this range.
+    func measure(_ range: NSRange, text: String) -> Metrics {
+        memo.measure(text, style: uniformStyle(in: range)) {
+            let sub = source.attributedSubstring(from: range)
+            resetScratch(with: sub.string)
+            sub.enumerateAttributes(in: NSRange(location: 0, length: sub.length), options: []) {
+                attrs, runRange, _ in
+                apply(attrs, to: runRange)
+            }
+            return measureScratch()
         }
-        return measureScratch()
     }
 
     /// A string measured in the font found at a source location.
     func measure(_ string: String, fontAt location: Int) -> Metrics {
-        resetScratch(with: string)
         let length = source.length
-        if length > 0 {
-            let index = min(max(location, 0), length - 1)
-            let attrs = source.attributes(at: index, effectiveRange: nil)
+        let index = min(max(location, 0), length - 1)
+        let attrs = length > 0 ? source.attributes(at: index, effectiveRange: nil) : [:]
+        return memo.measure(string, style: style(for: attrs)) {
+            resetScratch(with: string)
             apply(attrs, to: NSRange(location: 0, length: (string as NSString).length))
+            return measureScratch()
         }
-        return measureScratch()
+    }
+
+    private func style(for attrs: [NSAttributedString.Key: Any]) -> AttributedMeasurementMemo.Style?
+    {
+        AttributedMeasurementMemo.Style(font: attrs[Self.fontKey], kern: attrs[Self.kernKey])
+    }
+
+    private func uniformStyle(in range: NSRange) -> AttributedMeasurementMemo.Style? {
+        guard range.length > 0 else { return nil }
+        var run = NSRange()
+        let attrs = source.attributes(at: range.location, effectiveRange: &run)
+        guard let first = style(for: attrs) else { return nil }
+        while NSMaxRange(run) < NSMaxRange(range) {
+            let next = source.attributes(at: NSMaxRange(run), effectiveRange: &run)
+            guard style(for: next) == first else { return nil }
+        }
+        return first
     }
 
     /// Each grapheme's own width within a range, for overflow breaking.
@@ -577,8 +615,9 @@ private final class AttributedSegmentMeasurer {
         widths.reserveCapacity(text.count)
         var offset = range.location
         for char in text {
-            let length = String(char).utf16.count
-            widths.append(measure(NSRange(location: offset, length: length)).width)
+            let grapheme = String(char)
+            let length = grapheme.utf16.count
+            widths.append(measure(NSRange(location: offset, length: length), text: grapheme).width)
             offset += length
         }
         return widths
@@ -604,7 +643,7 @@ private final class AttributedSegmentMeasurer {
     }
 
     private func measureScratch() -> Metrics {
-        let line = CTLineCreateWithAttributedString(scratch)
+        let line = makeLine(scratch)
         var ascent: CGFloat = 0
         var descent: CGFloat = 0
         var leading: CGFloat = 0
