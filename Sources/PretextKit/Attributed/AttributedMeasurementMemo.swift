@@ -18,12 +18,14 @@ final class AttributedMeasurementMemo {
         let font: AnyObject?
         let kernBits: UInt64?
 
-        init?(font: Any?, kern: Any?) {
-            self.font = font as AnyObject?
+        init?(font: AnyObject?, kern: AnyObject?) {
+            self.font = font
             if let kern {
-                guard let number = kern as? NSNumber, CFGetTypeID(number) == CFNumberGetTypeID()
+                // A Boolean also bridges to NSNumber, but it has a different CF type.
+                guard kern.isKind?(of: NSNumber.self) == true,
+                    CFGetTypeID(kern) == CFNumberGetTypeID()
                 else { return nil }
-                kernBits = number.doubleValue.bitPattern
+                kernBits = unsafeDowncast(kern, to: NSNumber.self).doubleValue.bitPattern
             } else {
                 kernBits = nil
             }
@@ -40,11 +42,24 @@ final class AttributedMeasurementMemo {
 
         static func == (lhs: Self, rhs: Self) -> Bool {
             // CoreText receives the original code units, including decomposed spellings.
-            lhs.style == rhs.style && lhs.text.utf8.elementsEqual(rhs.text.utf8)
+            guard lhs.style == rhs.style, lhs.text.utf8.count == rhs.text.utf8.count else {
+                return false
+            }
+            var left = lhs.text
+            var right = rhs.text
+            return left.withUTF8 { leftBytes in
+                right.withUTF8 { rightBytes in
+                    guard let leftBase = leftBytes.baseAddress,
+                        let rightBase = rightBytes.baseAddress
+                    else { return leftBytes.isEmpty }
+                    return memcmp(leftBase, rightBase, leftBytes.count) == 0
+                }
+            }
         }
 
         func hash(into hasher: inout Hasher) {
-            hasher.combine(text)
+            var spelling = text
+            spelling.withUTF8 { hasher.combine(bytes: UnsafeRawBufferPointer($0)) }
             hasher.combine(style.font.map(ObjectIdentifier.init))
             hasher.combine(style.kernBits)
         }
@@ -73,20 +88,22 @@ final class AttributedMeasurementMemo {
     private var entries: [Key: Metrics] = [:]
     private var estimatedBytes = 0
 
+    var isEnabled: Bool { byteLimit > 0 }
+
     init(byteLimit: Int) {
         self.byteLimit = byteLimit
     }
 
-    func measure(_ text: String, style: @autoclosure () -> Style?, onMiss: () -> Metrics)
-        -> Metrics
-    {
-        guard byteLimit > 0, let style = style() else { return onMiss() }
-        let key = Key(text: text, style: style)
+    func measure(_ text: String, style: Style?, onMiss: () -> Metrics) -> Metrics {
+        guard isEnabled, let style else { return onMiss() }
+        var spelling = text
+        spelling.makeContiguousUTF8()
+        let key = Key(text: spelling, style: style)
         if let cached = entries[key] { return cached }
 
         let result = onMiss()
         // The fixed charge covers the key, metrics, text storage header, and dictionary bucket.
-        let cost = 128 + text.utf8.count
+        let cost = 128 + spelling.utf8.count
         if cost >= byteLimit - estimatedBytes {
             entries.removeAll()
             estimatedBytes = 0

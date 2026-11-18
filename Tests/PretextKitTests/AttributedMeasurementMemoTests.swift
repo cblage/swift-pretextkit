@@ -12,6 +12,7 @@ struct AttributedMeasurementMemoTests {
 
     private final class LineCounter {
         var builds: [String: Int] = [:]
+        var count: Int { builds.values.reduce(0, +) }
 
         func makeLine(_ text: CFAttributedString) -> CTLine {
             builds[CFAttributedStringGetString(text) as String, default: 0] += 1
@@ -156,6 +157,86 @@ struct AttributedMeasurementMemoTests {
         expectSame(warm, expected)
         #expect(counter.builds == ["mixed": 1, "kerning": 1])
         expectSame(prepareAttributed(source, attachmentMetrics: Self.attachment), expected)
+    }
+
+    @Test("A prepare computes one style per run, including runs inside overlong words")
+    func stylesPerRun() throws {
+        let body = CTFontCreateWithName("Helvetica" as CFString, 16, nil)
+        let italic = CTFontCreateWithName("Helvetica-Oblique" as CFString, 23, nil)
+        let prefix = "red red\t"
+        let word = String(repeating: "abe\u{301}", count: 12)
+        let source = NSMutableAttributedString(
+            string: "\(prefix)\(word) \(word)\nred", attributes: Self.attributes(body))
+        // Both boundaries split a grapheme. Only the second word changes measurement style.
+        let decoration = NSRange(location: prefix.utf16.count + 11, length: 16)
+        let mixed = NSRange(location: decoration.location + word.utf16.count + 1, length: 16)
+        source.addAttribute(.init("Decoration"), value: 1, range: decoration)
+        source.addAttributes(Self.attributes(italic, 1.25), range: mixed)
+        let range = NSRange(location: 0, length: source.length)
+        var runCount = 0
+        source.enumerateAttributes(in: range) { _, _, _ in runCount += 1 }
+        #expect(runCount == 5)
+
+        let uncached = LineCounter()
+        let expected = prepareAttributed(
+            source,
+            measurer: AttributedSegmentMeasurer(
+                source: source, memo: .init(byteLimit: 0), makeLine: uncached.makeLine))
+        let words = expected.segments.indices.filter { expected.segments[$0] == word }
+        #expect(words.count == 2)
+        for index in words {
+            #expect(try #require(expected.core.breakableWidths[index]).count == word.count)
+        }
+
+        let memo = AttributedMeasurementMemo(byteLimit: 1 << 20)
+        let cold = LineCounter()
+        let warm = LineCounter()
+        for counter in [cold, warm] {
+            var styles = 0
+            let measurer = AttributedSegmentMeasurer(
+                source: source, memo: memo, makeLine: counter.makeLine,
+                makeStyle: { font, kern in
+                    styles += 1
+                    return .init(font: font, kern: kern)
+                })
+            expectSame(prepareAttributed(source, measurer: measurer), expected)
+            #expect(styles == runCount)
+        }
+        #expect(cold.count == 13)
+        #expect(warm.count == 3)
+        // Only mixed styles build lines on the warm pass.
+        // Each other measurement accounts for one dictionary lookup.
+        #expect(uncached.count - warm.count == 80)
+    }
+
+    @Test("Equal-length canonical spellings have separate entries and empty text can hit")
+    func exactUTF8Keys() {
+        let first = "a\u{301}\u{327}"
+        let second = "a\u{327}\u{301}"
+        #expect(first == second)
+        #expect(first.utf8.count == second.utf8.count)
+        let counter = LineCounter()
+        let measurer = AttributedSegmentMeasurer(
+            source: NSAttributedString(string: "x"), memo: .init(byteLimit: 1 << 20),
+            makeLine: counter.makeLine)
+        for text in [first, second, "", first, second, ""] {
+            _ = measurer.measure(text, fontAt: 0)
+        }
+        #expect(counter.count == 3)
+    }
+
+    @Test("Only CF numbers supply kern bits, including the sign of zero")
+    func kernBits() throws {
+        typealias Style = AttributedMeasurementMemo.Style
+        let absent = try #require(Style(font: nil, kern: nil))
+        let positive = try #require(Style(font: nil, kern: NSNumber(value: 0.0)))
+        let negative = try #require(Style(font: nil, kern: NSNumber(value: -0.0)))
+        #expect(absent != positive)
+        #expect(positive != negative)
+        #expect(negative.kernBits == (-0.0 as Double).bitPattern)
+        #expect(Style(font: nil, kern: kCFBooleanTrue) == nil)
+        #expect(Style(font: nil, kern: "1" as NSString) == nil)
+        #expect(Style(font: nil, kern: LineCounter()) == nil)
     }
 
     @Test("Ten copies of each word build one CoreText line for each word, font and kern")

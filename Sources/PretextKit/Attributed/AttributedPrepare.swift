@@ -550,62 +550,115 @@ final class AttributedSegmentMeasurer {
     private static let fontKey = NSAttributedString.Key("NSFont")
     private static let kernKey = NSAttributedString.Key("NSKern")
 
+    private struct Run {
+        let range: NSRange
+        let font: AnyObject?
+        let kern: AnyObject?
+        let style: AttributedMeasurementMemo.Style?
+    }
+
     private let source: NSAttributedString
     private let memo: AttributedMeasurementMemo
     private let makeLine: (CFAttributedString) -> CTLine
+    private let makeStyle: (AnyObject?, AnyObject?) -> AttributedMeasurementMemo.Style?
+    private var currentRun: Run?
+    // A word can cross runs before its graphemes walk the same range from the start.
+    private var followingRuns: ArraySlice<Run> = []
     private lazy var scratch: CFMutableAttributedString =
         CFAttributedStringCreateMutable(kCFAllocatorDefault, 0)
 
     init(
         source: NSAttributedString, memo: AttributedMeasurementMemo = .current,
-        makeLine: @escaping (CFAttributedString) -> CTLine = CTLineCreateWithAttributedString
+        makeLine: @escaping (CFAttributedString) -> CTLine = CTLineCreateWithAttributedString,
+        makeStyle: @escaping (AnyObject?, AnyObject?) -> AttributedMeasurementMemo.Style? =
+            AttributedMeasurementMemo.Style.init
     ) {
         self.source = source
         self.memo = memo
         self.makeLine = makeLine
+        self.makeStyle = makeStyle
     }
 
     /// The typographic width and metrics of a source range, its runs' fonts
     /// and kerning applied. The segmenter already holds the text at this range.
     func measure(_ range: NSRange, text: String) -> Metrics {
-        memo.measure(text, style: uniformStyle(in: range)) {
+        guard memo.isEnabled, range.length > 0 else {
             let sub = source.attributedSubstring(from: range)
             resetScratch(with: sub.string)
             sub.enumerateAttributes(in: NSRange(location: 0, length: sub.length), options: []) {
                 attrs, runRange, _ in
-                apply(attrs, to: runRange)
+                apply(
+                    font: attrs[Self.fontKey].map { $0 as AnyObject },
+                    kern: attrs[Self.kernKey].map { $0 as AnyObject }, to: runRange)
             }
+            return measureScratch()
+        }
+
+        let first = run(at: range.location)
+        let end = NSMaxRange(range)
+        if end <= NSMaxRange(first.range) { return measure(text, in: first) }
+
+        var location = NSMaxRange(first.range)
+        var index = followingRuns.startIndex
+        while location < end {
+            if index == followingRuns.endIndex {
+                followingRuns.append(readRun(at: location))
+            }
+            location = NSMaxRange(followingRuns[index].range)
+            index += 1
+        }
+        let rest = followingRuns[..<index]
+        let style = rest.allSatisfy { $0.style == first.style } ? first.style : nil
+        return memo.measure(text, style: style) {
+            resetScratch(with: text)
+            func applyRun(_ run: Run) {
+                let overlap = NSIntersectionRange(range, run.range)
+                let local = NSRange(
+                    location: overlap.location - range.location, length: overlap.length)
+                apply(font: run.font, kern: run.kern, to: local)
+            }
+            applyRun(first)
+            for run in rest { applyRun(run) }
             return measureScratch()
         }
     }
 
     /// A string measured in the font found at a source location.
     func measure(_ string: String, fontAt location: Int) -> Metrics {
-        let length = source.length
-        let index = min(max(location, 0), length - 1)
-        let attrs = length > 0 ? source.attributes(at: index, effectiveRange: nil) : [:]
-        return memo.measure(string, style: style(for: attrs)) {
+        let index = min(max(location, 0), source.length - 1)
+        return measure(string, in: run(at: index))
+    }
+
+    private func measure(_ string: String, in run: Run) -> Metrics {
+        memo.measure(string, style: run.style) {
             resetScratch(with: string)
-            apply(attrs, to: NSRange(location: 0, length: (string as NSString).length))
+            let range = NSRange(location: 0, length: string.utf16.count)
+            apply(font: run.font, kern: run.kern, to: range)
             return measureScratch()
         }
     }
 
-    private func style(for attrs: [NSAttributedString.Key: Any]) -> AttributedMeasurementMemo.Style?
-    {
-        AttributedMeasurementMemo.Style(font: attrs[Self.fontKey], kern: attrs[Self.kernKey])
+    private func run(at location: Int) -> Run {
+        if let currentRun, NSLocationInRange(location, currentRun.range) { return currentRun }
+        while let next = followingRuns.popFirst() {
+            if followingRuns.isEmpty { followingRuns = [] }
+            if NSLocationInRange(location, next.range) {
+                currentRun = next
+                return next
+            }
+        }
+        let next = readRun(at: location)
+        currentRun = next
+        return next
     }
 
-    private func uniformStyle(in range: NSRange) -> AttributedMeasurementMemo.Style? {
-        guard range.length > 0 else { return nil }
-        var run = NSRange()
-        let attrs = source.attributes(at: range.location, effectiveRange: &run)
-        guard let first = style(for: attrs) else { return nil }
-        while NSMaxRange(run) < NSMaxRange(range) {
-            let next = source.attributes(at: NSMaxRange(run), effectiveRange: &run)
-            guard style(for: next) == first else { return nil }
-        }
-        return first
+    private func readRun(at location: Int) -> Run {
+        var range = NSRange()
+        let attrs = location >= 0 ? source.attributes(at: location, effectiveRange: &range) : [:]
+        let font = attrs[Self.fontKey].map { $0 as AnyObject }
+        let kern = attrs[Self.kernKey].map { $0 as AnyObject }
+        let style = memo.isEnabled ? makeStyle(font, kern) : nil
+        return Run(range: range, font: font, kern: kern, style: style)
     }
 
     /// Each grapheme's own width within a range, for overflow breaking.
@@ -632,13 +685,13 @@ final class AttributedSegmentMeasurer {
         }
     }
 
-    private func apply(_ attrs: [NSAttributedString.Key: Any], to range: NSRange) {
+    private func apply(font: AnyObject?, kern: AnyObject?, to range: NSRange) {
         let cfRange = CFRangeMake(range.location, range.length)
-        if let font = attrs[Self.fontKey] {
-            CFAttributedStringSetAttribute(scratch, cfRange, kCTFontAttributeName, font as AnyObject)
+        if let font {
+            CFAttributedStringSetAttribute(scratch, cfRange, kCTFontAttributeName, font)
         }
-        if let kern = attrs[Self.kernKey] {
-            CFAttributedStringSetAttribute(scratch, cfRange, kCTKernAttributeName, kern as AnyObject)
+        if let kern {
+            CFAttributedStringSetAttribute(scratch, cfRange, kCTKernAttributeName, kern)
         }
     }
 
