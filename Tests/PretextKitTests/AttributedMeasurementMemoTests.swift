@@ -33,6 +33,14 @@ struct AttributedMeasurementMemoTests {
         [metrics.width.bitPattern, metrics.ascent.bitPattern, metrics.descent.bitPattern]
     }
 
+    private func originalBits(_ source: NSAttributedString) -> [UInt32] {
+        let line = CTLineCreateWithAttributedString(source as CFAttributedString)
+        var ascent: CGFloat = 0
+        var descent: CGFloat = 0
+        let width = CTLineGetTypographicBounds(line, &ascent, &descent, nil)
+        return [Float(width).bitPattern, Float(ascent).bitPattern, Float(descent).bitPattern]
+    }
+
     @Test("Every spelling, font object and kern reproduces all three CoreText metrics")
     func metricBits() throws {
         let system = try #require(CTFontCreateUIFontForLanguage(.system, 18, nil))
@@ -75,7 +83,8 @@ struct AttributedMeasurementMemoTests {
                         source: source, memo: .init(byteLimit: 0))
                     let cached = AttributedSegmentMeasurer(
                         source: source, memo: memo, makeLine: counter.makeLine)
-                    let expected = bits(uncached.measure(range, text: text))
+                    let expected = originalBits(source)
+                    #expect(bits(uncached.measure(range, text: text)) == expected)
                     #expect(bits(cached.measure(range, text: text)) == expected)
                     #expect(bits(cached.measure(text, fontAt: 0)) == expected)
                     #expect(bits(cached.measure(range, text: text)) == expected)
@@ -157,6 +166,176 @@ struct AttributedMeasurementMemoTests {
         expectSame(warm, expected)
         #expect(counter.builds == ["mixed": 1, "kerning": 1])
         expectSame(prepareAttributed(source, attachmentMetrics: Self.attachment), expected)
+    }
+
+    @Test("Mixed runs and attachments keep every metric across a mid-document eviction")
+    func evictionDuringPrepare() {
+        let font = CTFontCreateWithName("Menlo" as CFString, 17, nil)
+        let block = NSMutableAttributedString(
+            string: "echo echo ", attributes: Self.attributes(font, -0.75))
+        block.append(Self.mixedDocument())
+        let source = NSMutableAttributedString(attributedString: block)
+        source.append(NSAttributedString(string: " \u{fffc} "))
+        let middle = block.length + 1
+        source.append(block)
+        func attachment(_ location: Int) -> AttachmentMetrics {
+            AttachmentMetrics(width: CGFloat(11 + location % 31), ascent: 12, descent: 3)
+        }
+        let disabled = AttributedMeasurementMemo(byteLimit: 0)
+        let expected = prepareAttributed(
+            source, attachmentMetrics: attachment,
+            measurer: AttributedSegmentMeasurer(source: source, memo: disabled))
+        let limit = 16 << 10
+        let memo = AttributedMeasurementMemo(byteLimit: limit)
+        let counter = LineCounter()
+        let oversized = String(repeating: "x", count: limit)
+        var clears = 0
+        let actual = prepareAttributed(
+            source,
+            attachmentMetrics: { location in
+                if location == middle {
+                    _ = memo.measure(oversized, style: .init(font: nil, kern: nil)) {
+                        .init(width: 0, ascent: 0, descent: 0)
+                    }
+                    clears += 1
+                }
+                return attachment(location)
+            },
+            measurer: AttributedSegmentMeasurer(
+                source: source, memo: memo, makeLine: counter.makeLine))
+        #expect(!disabled.isEnabled && memo.isEnabled)
+        #expect(clears == 1)
+        #expect(counter.builds["echo"] == 2)
+        expectSame(actual, expected)
+        for i in actual.segments.indices
+        where actual.kinds[i] == .text && actual.segments[i] != "\u{fffc}" {
+            let range = NSRange(location: actual.utf16Starts[i], length: actual.utf16Lengths[i])
+            let metrics = [actual.widths[i], actual.ascents[i], actual.descents[i]]
+            let original = source.attributedSubstring(from: range)
+            #expect(metrics.map(\.bitPattern) == originalBits(original))
+        }
+    }
+
+    @Test("Only one source-font owner survives a lookup and eviction releases both fonts")
+    func fontOwnership() throws {
+        typealias Style = AttributedMeasurementMemo.Style
+        let font = CTFontCreateWithName("Helvetica" as CFString, 17.125, nil)
+        let kern = NSNumber(value: 0.375_001_234_567_89)
+        let source = NSAttributedString(string: "word", attributes: Self.attributes(font, kern))
+        let borrowed = Unmanaged.passUnretained(font)
+        let borrowedKern = Unmanaged.passUnretained(kern)
+        let address = UnsafeRawPointer(borrowed.toOpaque())
+        func references() -> CFIndex {
+            borrowed._withUnsafeGuaranteedRef { CFGetRetainCount($0) }
+        }
+        func kernReferences() -> CFIndex {
+            borrowedKern._withUnsafeGuaranteedRef { CFGetRetainCount($0) }
+        }
+        let style = try #require(Style(font: address, kern: kern))
+        // A trivial optional has no ARC operations even for copies destroyed inside a hit.
+        #expect(_isPOD(Style?.self))
+        let limit = 4096
+        let memo = AttributedMeasurementMemo(byteLimit: limit)
+        var inLine: [[CFIndex]] = []
+        let measurer = AttributedSegmentMeasurer(source: source, memo: memo) { scratch in
+            inLine.append([references(), kernReferences()])
+            return CTLineCreateWithAttributedString(scratch)
+        }
+        withExtendedLifetime((font, kern, source)) {
+            let before = references()
+            let beforeKern = kernReferences()
+            var misses: [CFIndex] = []
+            for word in ["word", "other", "word"] {
+                _ = memo.measure(word, style: style) {
+                    misses.append(references())
+                    return .init(width: 7, ascent: 3, descent: 1)
+                }
+                #expect(references() == before + 1)
+            }
+            let hit = measurer.measure(
+                NSRange(location: 0, length: source.length), text: source.string)
+            #expect(hit.width == 7 && inLine.isEmpty)
+            #expect(misses == [before + 1, before + 1])
+            #expect(references() == before + 1)
+            #expect(kernReferences() == beforeKern)
+            autoreleasepool { _ = measurer.measure("unseen", fontAt: 0) }
+            #expect(inLine == [[before + 1, beforeKern]])
+            let copy = memo.measurementFont(for: address)
+            let copyCount = CFGetRetainCount(copy)
+            _ = memo.measure(String(repeating: "x", count: limit), style: style) {
+                #expect(references() == before)
+                return .init(width: 1, ascent: 1, descent: 0)
+            }
+            #expect(references() == before)
+            #expect(CFGetRetainCount(copy) == copyCount - 1)
+            let rebuilt = memo.measure("word", style: style) {
+                AttributedSegmentMeasurer.Metrics(width: 9, ascent: 3, descent: 1)
+            }
+            #expect(rebuilt.width == 9)
+            #expect(memo.measurementFont(for: address) !== copy)
+        }
+    }
+
+    @Test(
+        "Two live lines use private fonts for both explicit and default faces",
+        arguments: [false, true], [false, true])
+    func workerFontCopies(explicitFont: Bool, withKern: Bool) {
+        let font = CTFontCreateWithName("Helvetica" as CFString, 19.25, nil)
+        let source = NSAttributedString(
+            string: "office",
+            attributes: Self.attributes(explicitFont ? font : nil, withKern ? 0.5 : nil))
+        let expected = originalBits(source)
+        let ready = DispatchGroup()
+        let finished = DispatchGroup()
+        typealias Output = (
+            scratch: ObjectIdentifier?, glyphs: ObjectIdentifier?, metrics: [UInt32]
+        )
+        let results = OSAllocatedUnfairLock(initialState: [Output]())
+        ready.enter()
+        ready.enter()
+        for _ in 0..<2 {
+            finished.enter()
+            Thread.detachNewThread {
+                var scratchFont: ObjectIdentifier?
+                var glyphFont: ObjectIdentifier?
+                var reachedLine = false
+                let measurer = AttributedSegmentMeasurer(source: source) { scratch in
+                    let input = CFAttributedStringGetAttribute(
+                        scratch, 0, kCTFontAttributeName, nil)
+                    scratchFont = input.map(ObjectIdentifier.init)
+                    let line = CTLineCreateWithAttributedString(scratch)
+                    let runs = CTLineGetGlyphRuns(line)
+                    if CFArrayGetCount(runs) > 0, let first = CFArrayGetValueAtIndex(runs, 0) {
+                        let run = Unmanaged<CTRun>.fromOpaque(first).takeUnretainedValue()
+                        let attrs = CTRunGetAttributes(run) as NSDictionary
+                        glyphFont = attrs[kCTFontAttributeName].map {
+                            ObjectIdentifier($0 as AnyObject)
+                        }
+                    }
+                    if !reachedLine {
+                        reachedLine = true
+                        ready.leave()
+                        ready.wait()
+                    }
+                    return line
+                }
+                let metrics = measurer.measure(
+                    NSRange(location: 0, length: source.length), text: source.string)
+                if !reachedLine { ready.leave() }
+                let result: Output = (scratchFont, glyphFont, bits(metrics))
+                results.withLock { $0.append(result) }
+                finished.leave()
+            }
+        }
+        finished.wait()
+        let outputs = results.withLock { $0 }
+        #expect(outputs.count == 2)
+        #expect(Set(outputs.compactMap(\.scratch)).count == 2)
+        for output in outputs {
+            #expect(output.scratch != ObjectIdentifier(font))
+            #expect(output.glyphs == output.scratch)
+            #expect(output.metrics == expected)
+        }
     }
 
     @Test("A prepare computes one style per run, including runs inside overlong words")

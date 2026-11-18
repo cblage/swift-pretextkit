@@ -1,3 +1,4 @@
+import CoreText
 import Darwin
 import Foundation
 import os
@@ -15,10 +16,10 @@ final class AttributedMeasurementMemo {
     typealias Metrics = AttributedSegmentMeasurer.Metrics
 
     struct Style: Equatable {
-        let font: AnyObject?
+        let font: UnsafeRawPointer?
         let kernBits: UInt64?
 
-        init?(font: AnyObject?, kern: AnyObject?) {
+        init?(font: UnsafeRawPointer?, kern: AnyObject?) {
             self.font = font
             if let kern {
                 // A Boolean also bridges to NSNumber, but it has a different CF type.
@@ -29,10 +30,6 @@ final class AttributedMeasurementMemo {
             } else {
                 kernBits = nil
             }
-        }
-
-        static func == (lhs: Self, rhs: Self) -> Bool {
-            lhs.font === rhs.font && lhs.kernBits == rhs.kernBits
         }
     }
 
@@ -60,7 +57,7 @@ final class AttributedMeasurementMemo {
         func hash(into hasher: inout Hasher) {
             var spelling = text
             spelling.withUTF8 { hasher.combine(bytes: UnsafeRawBufferPointer($0)) }
-            hasher.combine(style.font.map(ObjectIdentifier.init))
+            hasher.combine(style.font)
             hasher.combine(style.kernBits)
         }
     }
@@ -84,14 +81,54 @@ final class AttributedMeasurementMemo {
         return memo
     }
 
+    private final class Font {
+        // One owner prevents address reuse. Only this thread builds lines with the copy.
+        let source: AnyObject?
+        let copy: AnyObject
+
+        init(_ address: UnsafeRawPointer?) {
+            source = address.map { Unmanaged<AnyObject>.fromOpaque($0).takeUnretainedValue() }
+            copy = Self.copy(of: address)
+        }
+
+        static func copy(of address: UnsafeRawPointer?) -> AnyObject {
+            guard let address else {
+                // CoreText specifies Helvetica 12 when the run has no font attribute.
+                return CTFontCreateWithName("Helvetica" as CFString, 12, nil)
+            }
+            return Unmanaged<AnyObject>.fromOpaque(address)._withUnsafeGuaranteedRef { object in
+                guard CFGetTypeID(object) == CTFontGetTypeID() else { return object }
+                return Unmanaged<CTFont>.fromOpaque(address)._withUnsafeGuaranteedRef {
+                    CTFontCreateCopyWithAttributes($0, 0, nil, nil)
+                }
+            }
+        }
+    }
+
     private let byteLimit: Int
+    // The charge covers a CoreText copy, its source owner and their dictionary bucket.
+    private static let fontCost = 1024
     private var entries: [Key: Metrics] = [:]
+    private var fonts: [UnsafeRawPointer?: Font] = [:]
     private var estimatedBytes = 0
+    private var generation = 0
 
     var isEnabled: Bool { byteLimit > 0 }
 
     init(byteLimit: Int) {
         self.byteLimit = byteLimit
+    }
+
+    func measurementFont(for address: UnsafeRawPointer?) -> AnyObject {
+        if let font = fonts[address] { return font.copy }
+        // A mixed run can introduce a font without a metric entry of its own.
+        guard !entries.isEmpty, Self.fontCost < byteLimit - estimatedBytes else {
+            return Font.copy(of: address)
+        }
+        let font = Font(address)
+        fonts[address] = font
+        estimatedBytes += Self.fontCost
+        return font.copy
     }
 
     func measure(_ text: String, style: Style?, onMiss: () -> Metrics) -> Metrics {
@@ -101,17 +138,27 @@ final class AttributedMeasurementMemo {
         let key = Key(text: spelling, style: style)
         if let cached = entries[key] { return cached }
 
-        let result = onMiss()
         // The fixed charge covers the key, metrics, text storage header, and dictionary bucket.
-        let cost = 128 + spelling.utf8.count
+        let keyCost = 128 + spelling.utf8.count
+        // A missing source font needs no address pin, even when only the metrics fit.
+        let keepFont = style.font != nil || keyCost + Self.fontCost < byteLimit
+        var needsFont = keepFont && fonts.index(forKey: style.font) == nil
+        var cost = keyCost + (needsFont ? Self.fontCost : 0)
         if cost >= byteLimit - estimatedBytes {
             entries.removeAll()
+            fonts.removeAll()
             estimatedBytes = 0
+            generation &+= 1
+            needsFont = keepFont
+            cost = keyCost + (needsFont ? Self.fontCost : 0)
         }
-        if cost < byteLimit {
-            entries[key] = result
-            estimatedBytes += cost
-        }
+        guard cost < byteLimit else { return onMiss() }
+        if needsFont { fonts[style.font] = Font(style.font) }
+        estimatedBytes += cost
+        let reservedGeneration = generation
+        let result = onMiss()
+        // A nested miss can clear the reservation and its font while it builds the line.
+        if generation == reservedGeneration { entries[key] = result }
         return result
     }
 }

@@ -545,23 +545,21 @@ final class AttributedSegmentMeasurer {
         var descent: Float
     }
 
-    /// AppKit's and UIKit's `.font` and `.kern` keys, by their raw names,
-    /// so this file needs neither framework.
-    private static let fontKey = NSAttributedString.Key("NSFont")
-    private static let kernKey = NSAttributedString.Key("NSKern")
+    private static let fontKey = Unmanaged.passUnretained(kCTFontAttributeName).toOpaque()
+    private static let kernKey = Unmanaged.passUnretained(kCTKernAttributeName).toOpaque()
 
     private struct Run {
         let range: NSRange
-        let font: AnyObject?
-        let kern: AnyObject?
+        // The dictionary keeps even a subclass's bridged attribute values alive while borrowed.
+        let attributes: CFDictionary?
         let style: AttributedMeasurementMemo.Style?
     }
 
     private let source: NSAttributedString
     private let memo: AttributedMeasurementMemo
     private let makeLine: (CFAttributedString) -> CTLine
-    private let makeStyle: (AnyObject?, AnyObject?) -> AttributedMeasurementMemo.Style?
-    private var currentRun: Run?
+    private let makeStyle: (UnsafeRawPointer?, AnyObject?) -> AttributedMeasurementMemo.Style?
+    private var currentRun = Run(range: NSRange(), attributes: nil, style: nil)
     // A word can cross runs before its graphemes walk the same range from the start.
     private var followingRuns: ArraySlice<Run> = []
     private lazy var scratch: CFMutableAttributedString =
@@ -570,7 +568,7 @@ final class AttributedSegmentMeasurer {
     init(
         source: NSAttributedString, memo: AttributedMeasurementMemo = .current,
         makeLine: @escaping (CFAttributedString) -> CTLine = CTLineCreateWithAttributedString,
-        makeStyle: @escaping (AnyObject?, AnyObject?) -> AttributedMeasurementMemo.Style? =
+        makeStyle: @escaping (UnsafeRawPointer?, AnyObject?) -> AttributedMeasurementMemo.Style? =
             AttributedMeasurementMemo.Style.init
     ) {
         self.source = source
@@ -582,43 +580,36 @@ final class AttributedSegmentMeasurer {
     /// The typographic width and metrics of a source range, its runs' fonts
     /// and kerning applied. The segmenter already holds the text at this range.
     func measure(_ range: NSRange, text: String) -> Metrics {
-        guard memo.isEnabled, range.length > 0 else {
-            let sub = source.attributedSubstring(from: range)
-            resetScratch(with: sub.string)
-            sub.enumerateAttributes(in: NSRange(location: 0, length: sub.length), options: []) {
-                attrs, runRange, _ in
-                apply(
-                    font: attrs[Self.fontKey].map { $0 as AnyObject },
-                    kern: attrs[Self.kernKey].map { $0 as AnyObject }, to: runRange)
-            }
+        guard range.length > 0 else {
+            resetScratch(with: "")
             return measureScratch()
         }
 
-        let first = run(at: range.location)
+        selectRun(at: range.location)
         let end = NSMaxRange(range)
-        if end <= NSMaxRange(first.range) { return measure(text, in: first) }
+        if end <= NSMaxRange(currentRun.range) { return measureInCurrentRun(text) }
 
-        var location = NSMaxRange(first.range)
+        var location = NSMaxRange(currentRun.range)
         var index = followingRuns.startIndex
+        var style = currentRun.style
         while location < end {
             if index == followingRuns.endIndex {
                 followingRuns.append(readRun(at: location))
             }
+            if followingRuns[index].style != style { style = nil }
             location = NSMaxRange(followingRuns[index].range)
             index += 1
         }
-        let rest = followingRuns[..<index]
-        let style = rest.allSatisfy { $0.style == first.style } ? first.style : nil
         return memo.measure(text, style: style) {
             resetScratch(with: text)
             func applyRun(_ run: Run) {
                 let overlap = NSIntersectionRange(range, run.range)
                 let local = NSRange(
                     location: overlap.location - range.location, length: overlap.length)
-                apply(font: run.font, kern: run.kern, to: local)
+                apply(run, to: local)
             }
-            applyRun(first)
-            for run in rest { applyRun(run) }
+            applyRun(currentRun)
+            for i in followingRuns.startIndex..<index { applyRun(followingRuns[i]) }
             return measureScratch()
         }
     }
@@ -626,39 +617,50 @@ final class AttributedSegmentMeasurer {
     /// A string measured in the font found at a source location.
     func measure(_ string: String, fontAt location: Int) -> Metrics {
         let index = min(max(location, 0), source.length - 1)
-        return measure(string, in: run(at: index))
+        selectRun(at: index)
+        return measureInCurrentRun(string)
     }
 
-    private func measure(_ string: String, in run: Run) -> Metrics {
-        memo.measure(string, style: run.style) {
+    private func measureInCurrentRun(_ string: String) -> Metrics {
+        memo.measure(string, style: currentRun.style) {
             resetScratch(with: string)
             let range = NSRange(location: 0, length: string.utf16.count)
-            apply(font: run.font, kern: run.kern, to: range)
+            apply(currentRun, to: range)
             return measureScratch()
         }
     }
 
-    private func run(at location: Int) -> Run {
-        if let currentRun, NSLocationInRange(location, currentRun.range) { return currentRun }
+    private func selectRun(at location: Int) {
+        if NSLocationInRange(location, currentRun.range) { return }
         while let next = followingRuns.popFirst() {
             if followingRuns.isEmpty { followingRuns = [] }
             if NSLocationInRange(location, next.range) {
                 currentRun = next
-                return next
+                return
             }
         }
-        let next = readRun(at: location)
-        currentRun = next
-        return next
+        currentRun = readRun(at: location)
     }
 
     private func readRun(at location: Int) -> Run {
-        var range = NSRange()
-        let attrs = location >= 0 ? source.attributes(at: location, effectiveRange: &range) : [:]
-        let font = attrs[Self.fontKey].map { $0 as AnyObject }
-        let kern = attrs[Self.kernKey].map { $0 as AnyObject }
-        let style = memo.isEnabled ? makeStyle(font, kern) : nil
-        return Run(range: range, font: font, kern: kern, style: style)
+        guard location >= 0 else {
+            return Run(range: NSRange(), attributes: nil, style: makeStyle(nil, nil))
+        }
+        var range = CFRange()
+        let attrs = CFAttributedStringGetAttributes(source as CFAttributedString, location, &range)!
+        let font = CFDictionaryGetValue(attrs, Self.fontKey)
+        let kern = CFDictionaryGetValue(attrs, Self.kernKey)
+        let style: AttributedMeasurementMemo.Style?
+        if let kern {
+            style = Unmanaged<AnyObject>.fromOpaque(kern)._withUnsafeGuaranteedRef {
+                makeStyle(font, $0)
+            }
+        } else {
+            style = makeStyle(font, nil)
+        }
+        return Run(
+            range: NSRange(location: range.location, length: range.length),
+            attributes: attrs, style: style)
     }
 
     /// Each grapheme's own width within a range, for overflow breaking.
@@ -679,19 +681,24 @@ final class AttributedSegmentMeasurer {
     private func resetScratch(with string: String) {
         let current = CFAttributedStringGetLength(scratch)
         CFAttributedStringReplaceString(scratch, CFRangeMake(0, current), string as CFString)
-        let length = CFAttributedStringGetLength(scratch)
-        if length > 0 {
-            CFAttributedStringSetAttributes(scratch, CFRangeMake(0, length), [:] as CFDictionary, true)
-        }
     }
 
-    private func apply(font: AnyObject?, kern: AnyObject?, to range: NSRange) {
+    private func apply(_ run: borrowing Run, to range: NSRange) {
+        guard range.length > 0 else { return }
         let cfRange = CFRangeMake(range.location, range.length)
-        if let font {
-            CFAttributedStringSetAttribute(scratch, cfRange, kCTFontAttributeName, font)
-        }
-        if let kern {
-            CFAttributedStringSetAttribute(scratch, cfRange, kCTKernAttributeName, kern)
+        let font = run.attributes.flatMap { CFDictionaryGetValue($0, Self.fontKey) }
+        CFAttributedStringSetAttribute(
+            scratch, cfRange, kCTFontAttributeName, memo.measurementFont(for: font))
+        if let bits = run.style?.kernBits {
+            // The scratch string owns its numeric kern without retaining the source's number.
+            CFAttributedStringSetAttribute(
+                scratch, cfRange, kCTKernAttributeName, NSNumber(value: Double(bitPattern: bits)))
+        } else if run.style == nil, let attributes = run.attributes,
+            let kern = CFDictionaryGetValue(attributes, Self.kernKey)
+        {
+            Unmanaged<AnyObject>.fromOpaque(kern)._withUnsafeGuaranteedRef {
+                CFAttributedStringSetAttribute(scratch, cfRange, kCTKernAttributeName, $0)
+            }
         }
     }
 
@@ -701,6 +708,12 @@ final class AttributedSegmentMeasurer {
         var descent: CGFloat = 0
         var leading: CGFloat = 0
         let width = CTLineGetTypographicBounds(line, &ascent, &descent, &leading)
+        // Scratch relinquishes its fonts before a later measure can clear the memo.
+        let length = CFAttributedStringGetLength(scratch)
+        if length > 0 {
+            CFAttributedStringSetAttributes(
+                scratch, CFRangeMake(0, length), [:] as CFDictionary, true)
+        }
         return Metrics(width: Float(width), ascent: Float(ascent), descent: Float(descent))
     }
 }
