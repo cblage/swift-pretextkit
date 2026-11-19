@@ -592,15 +592,17 @@ final class AttributedSegmentMeasurer {
         var location = NSMaxRange(currentRun.range)
         var index = followingRuns.startIndex
         var style = currentRun.style
+        var runBreaks: [Int] = []
         while location < end {
             if index == followingRuns.endIndex {
                 followingRuns.append(readRun(at: location))
             }
             if followingRuns[index].style != style { style = nil }
+            if style != nil && memo.isEnabled { runBreaks.append(location - range.location) }
             location = NSMaxRange(followingRuns[index].range)
             index += 1
         }
-        return memo.measure(text, style: style) {
+        return memo.measure(text, style: style, runBreaks: runBreaks) {
             resetScratch(with: text)
             func applyRun(_ run: Run) {
                 let overlap = NSIntersectionRange(range, run.range)

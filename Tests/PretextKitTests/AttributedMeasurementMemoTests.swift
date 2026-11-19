@@ -1,3 +1,4 @@
+import CoreGraphics
 import CoreText
 import Foundation
 import Testing
@@ -139,6 +140,39 @@ struct AttributedMeasurementMemoTests {
         #expect(a.chunks.map(\.startSegmentIndex) == b.chunks.map(\.startSegmentIndex))
         #expect(a.chunks.map(\.endSegmentIndex) == b.chunks.map(\.endSegmentIndex))
         #expect(a.chunks.map(\.consumedEndSegmentIndex) == b.chunks.map(\.consumedEndSegmentIndex))
+    }
+
+    @Test("CoreText metrics follow the source run boundaries in either cache order")
+    func runBoundariesInBothOrders() throws {
+        let font = try #require(CTFontCreateUIFontForLanguage(.system, 13.5, nil))
+        let foreground = NSAttributedString.Key(kCTForegroundColorAttributeName as String)
+        let color = CGColor(gray: 0.25, alpha: 1)
+        for (word, cuts) in [
+            ("🦊", [1]), ("👩‍💻", [2, 3]), ("✈️", [1]), ("office", [2]), ("AV", [1]),
+        ] {
+            for kern: NSNumber? in [nil, NSNumber(value: 0.45)] {
+                let plain = NSMutableAttributedString(
+                    string: word, attributes: Self.attributes(font, kern))
+                var sources = [plain]
+                for cut in cuts {
+                    let split = NSMutableAttributedString(attributedString: plain)
+                    split.addAttribute(
+                        foreground, value: color, range: NSRange(location: 0, length: cut))
+                    sources.append(split)
+                }
+                for order in [sources, Array(sources.reversed())] {
+                    let memo = AttributedMeasurementMemo(byteLimit: 1 << 20)
+                    let counter = LineCounter()
+                    for source in order + order {
+                        let range = NSRange(location: 0, length: source.length)
+                        let measurer = AttributedSegmentMeasurer(
+                            source: source, memo: memo, makeLine: counter.makeLine)
+                        #expect(bits(measurer.measure(range, text: word)) == originalBits(source))
+                    }
+                    #expect(counter.builds[word] == sources.count)
+                }
+            }
+        }
     }
 
     @Test("Cold and warm mixed documents reproduce the uncached prepare, including attachments")
@@ -381,7 +415,8 @@ struct AttributedMeasurementMemoTests {
             expectSame(prepareAttributed(source, measurer: measurer), expected)
             #expect(styles == runCount)
         }
-        #expect(cold.count == 13)
+        #expect(cold.builds["e\u{301}"] == 5)
+        #expect(cold.count == 14)
         #expect(warm.count == 3)
         // Only mixed styles build lines on the warm pass.
         // Each other measurement accounts for one dictionary lookup.

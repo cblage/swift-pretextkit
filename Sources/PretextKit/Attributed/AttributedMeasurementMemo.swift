@@ -36,10 +36,13 @@ final class AttributedMeasurementMemo {
     private struct Key: Hashable {
         let text: String
         let style: Style
+        let runBreaks: [Int]
 
         static func == (lhs: Self, rhs: Self) -> Bool {
             // CoreText receives the original code units, including decomposed spellings.
-            guard lhs.style == rhs.style, lhs.text.utf8.count == rhs.text.utf8.count else {
+            guard lhs.style == rhs.style, lhs.runBreaks == rhs.runBreaks,
+                lhs.text.utf8.count == rhs.text.utf8.count
+            else {
                 return false
             }
             var left = lhs.text
@@ -59,6 +62,7 @@ final class AttributedMeasurementMemo {
             spelling.withUTF8 { hasher.combine(bytes: UnsafeRawBufferPointer($0)) }
             hasher.combine(style.font)
             hasher.combine(style.kernBits)
+            if !runBreaks.isEmpty { hasher.combine(runBreaks) }
         }
     }
 
@@ -131,15 +135,18 @@ final class AttributedMeasurementMemo {
         return font.copy
     }
 
-    func measure(_ text: String, style: Style?, onMiss: () -> Metrics) -> Metrics {
+    func measure(
+        _ text: String, style: Style?, runBreaks: [Int] = [], onMiss: () -> Metrics
+    ) -> Metrics {
         guard isEnabled, let style else { return onMiss() }
         var spelling = text
         spelling.makeContiguousUTF8()
-        let key = Key(text: spelling, style: style)
+        let key = Key(text: spelling, style: style, runBreaks: runBreaks)
         if let cached = entries[key] { return cached }
 
         // The fixed charge covers the key, metrics, text storage header, and dictionary bucket.
-        let keyCost = 128 + spelling.utf8.count
+        let runCost = runBreaks.isEmpty ? 0 : 32 + runBreaks.capacity * MemoryLayout<Int>.stride
+        let keyCost = 128 + spelling.utf8.count + runCost
         // A missing source font needs no address pin, even when only the metrics fit.
         let keepFont = style.font != nil || keyCost + Self.fontCost < byteLimit
         var needsFont = keepFont && fonts.index(forKey: style.font) == nil
