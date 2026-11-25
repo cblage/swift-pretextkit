@@ -222,9 +222,14 @@ private func materializeLineText(
 ///
 /// The walk reads `maxWidth` only in its three tests, `overflows` for an
 /// overlong segment and for its graphemes and `fits` for each later segment,
-/// and each one it makes is folded into the line's `bounds`, so the line's
-/// path is the same at every maximum width at which they hold. The tab
-/// advance reads the line's width and the tab stop, never `maxWidth`.
+/// and each one it makes is folded into the line's `bounds`, so the line is
+/// the same at every maximum width at which they hold. A line that ends at
+/// its last break keeps the bounds that break left, with the walk's reach
+/// past it refused: the segments the walk took past the break and dropped
+/// bound no narrower width, since a width that refuses one of them ends the
+/// line at the same break, and only a width that takes every segment up to
+/// the walk's next break moves the line (`reach`). The tab advance reads the
+/// line's width and the tab stop, never `maxWidth`.
 func walkSingleLine(
     _ core: PreparedCore,
     segments: [String],
@@ -242,6 +247,9 @@ func walkSingleLine(
     var pendingBreakIndex = -1
     var pendingBreakPaintWidth: Float = 0
     var bounds = LineWidthBounds.always
+    // The bounds as they stood at the pending break, which a line that ends
+    // there keeps.
+    var boundsAtBreak = LineWidthBounds.always
     let lineStart = start.segmentIndex
     let lineStartGrapheme = start.graphemeIndex
 
@@ -311,6 +319,7 @@ func walkSingleLine(
             if kind.canBreakAfter {
                 pendingBreakIndex = i
                 pendingBreakPaintWidth = core.lineEndPaintAdvances[i]
+                boundsAtBreak = bounds
             }
             continue
         }
@@ -321,22 +330,33 @@ func walkSingleLine(
             if kind.canBreakAfter {
                 pendingBreakIndex = i
                 pendingBreakPaintWidth = lineW
+                boundsAtBreak = bounds
             }
         } else if kind.isSimpleCollapsibleSpace {
             if kind.canBreakAfter {
                 pendingBreakIndex = i
                 pendingBreakPaintWidth = lineW
+                boundsAtBreak = bounds
             }
         } else {
             let endSeg = pendingBreakIndex >= 0 ? pendingBreakIndex + 1 : i
             let paintW = pendingBreakIndex >= 0 ? pendingBreakPaintWidth : lineW
+            let lineBounds = pendingBreakIndex >= 0
+                ? LineWidthBounds(
+                    fitted: boundsAtBreak.fitted,
+                    refused: min(
+                        boundsAtBreak.refused,
+                        reach(
+                            core, from: i, count: totalSegments, fit: fitW,
+                            lineWidth: lineW + advance)))
+                : bounds
             onLine(InternalLayoutLine(
                 startSegmentIndex: lineStart,
                 startGraphemeIndex: lineStartGrapheme,
                 endSegmentIndex: endSeg,
                 endGraphemeIndex: 0,
                 width: paintW,
-                bounds: bounds
+                bounds: lineBounds
             ))
             return
         }
@@ -352,4 +372,31 @@ func walkSingleLine(
             bounds: bounds
         ))
     }
+}
+
+/// The least maximum width at which a walk past a line's last break takes
+/// every segment up to its next break, from segment `index`, the one the
+/// line refused at `fit`, with `lineWidth` the line's width once it takes
+/// that segment. No segment between them can break, so the line moves only
+/// once all of them fit, and it ends at the same break while one is refused.
+/// A segment that can break moves it once it fits; the next one does too,
+/// unless it is a collapsible space, which the walk takes as its break even
+/// when it does not fit, so the reach is the last fit before such a space, a
+/// hard break or the end. The sums are the walker's own, in its order.
+private func reach(
+    _ core: PreparedCore, from index: Int, count: Int, fit: Float, lineWidth: Float
+) -> Float {
+    guard !core.kinds[index].canBreakAfter else { return fit }
+    var reached = fit
+    var width = lineWidth
+    var next = index + 1
+    while next < count, !core.kinds[next].canBreakAfter, core.kinds[next] != .hardBreak {
+        reached = width + core.lineEndFitAdvances[next]
+        width += core.widths[next]
+        next += 1
+    }
+    if next < count, core.kinds[next].canBreakAfter, !core.kinds[next].isSimpleCollapsibleSpace {
+        reached = width + core.lineEndFitAdvances[next]
+    }
+    return reached
 }

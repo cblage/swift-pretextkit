@@ -63,7 +63,7 @@ public struct LayoutLineRange: Sendable {
     public let start: LayoutCursor
     /// Cursor position at the end of this line.
     public let end: LayoutCursor
-    /// The maximum widths at which a walk from `start` takes this line's path
+    /// The maximum widths at which a walk from `start` returns this line
     /// again. The attributed `layoutNextLine` keeps them; `walkLineRanges`
     /// keeps none, so its lines hold at no width.
     public let bounds: LineWidthBounds
@@ -79,8 +79,8 @@ public struct LayoutLineRange: Sendable {
     }
 
     /// Whether a walk from `start` at `maxWidth` returns this line: every
-    /// comparison against the maximum width that made it gives the same answer
-    /// there.
+    /// comparison against the maximum width that decides it gives the same
+    /// answer there.
     public func holds(atMaxWidth maxWidth: CGFloat) -> Bool {
         bounds.holds(atMaxWidth: maxWidth)
     }
@@ -88,12 +88,15 @@ public struct LayoutLineRange: Sendable {
 
 // MARK: - Line Width Bounds
 
-/// The maximum widths at which a line walk takes the same path. The walk reads
-/// the maximum width only to compare a value of its own path against it, with
-/// the line-fit epsilon, so it takes the same path at every maximum width at
-/// which each of its comparisons gives the answer it gave: `fitted` is the
-/// greatest value it found within the width, and `refused` the least value it
-/// found past it.
+/// The maximum widths at which a line walk returns the same line. The walk
+/// reads the maximum width only to compare a value of its own path against it,
+/// with the line-fit epsilon, so it returns the same line at every maximum
+/// width at which each comparison that decides the line gives the answer it
+/// gave: `fitted` is the greatest value found within the width, and `refused`
+/// the least value found past it. For a line that ends at its last break, the
+/// segments the walk took past that break and dropped decide nothing, and
+/// `refused` is no greater than the walk's reach past the break
+/// (`walkSingleLine`).
 public struct LineWidthBounds: Sendable, Equatable {
     /// The greatest value a comparison found within the maximum width;
     /// negative infinity when none did.

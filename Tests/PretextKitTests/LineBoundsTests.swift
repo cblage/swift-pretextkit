@@ -272,25 +272,68 @@ struct LineBoundsTests {
         Self.expectExact(text, at: [20, 45, 70, 110, 160, 400], "mixed runs")
     }
 
-    // MARK: - Soundness Where a Line Holds More Widely
+    // MARK: - Words in Pieces
 
-    @Test("Two words with no break between them: holds only where the line is the same")
+    @Test("Two words with no break between them: the line holds wherever it is the same")
     func adjacentWords() {
         // "foo" and "(bar)" meet with no break opportunity, so past the space
         // the walk can take "foo" and still break at the space: at 30 the line
-        // is the same as at 22, though "foo" now fits. The bounds keep the
-        // comparison that changed, so they hold only up to it.
+        // is the same as at 22, though "foo" now fits. The line at 22 holds up
+        // to 50, where the walk takes "(bar)" too, and the line at 30 holds
+        // down to 5, where the space still fits.
         let text = Self.text([
             Self.word("x", 5), Self.space(5), Self.word("foo", 15), Self.word("(bar)", 25),
             Self.space(5), Self.word("z", 5),
         ])
         let first = Self.lines(text, maxWidth: 22)[0]
         #expect(first.end == LayoutCursor(segmentIndex: 2, graphemeIndex: 0))
-        #expect(!first.holds(atMaxWidth: 30))
+        #expect(first.bounds.refused == 50)
+        #expect(first.holds(atMaxWidth: 30))
         #expect(Self.same(layoutNextLine(text, start: first.start, maxWidth: 30), first))
-        let result = Self.compare(text, at: [8, 12, 22, 30, 45, 100])
-        #expect(result.holdsButDiffers.isEmpty, "\(result.holdsButDiffers.prefix(4))")
-        #expect(!result.differsButNotHolds.isEmpty, "the widths where the bounds are short")
+        let wide = Self.lines(text, maxWidth: 30)[0]
+        #expect(wide.bounds.fitted == 5)
+        #expect(wide.holds(atMaxWidth: 22))
+        Self.expectExact(text, at: [8, 12, 22, 30, 45, 100], "adjacent words")
+    }
+
+    /// A word in three pieces with no break between them, as the segmenter can
+    /// leave an identifier such as `w04_00001`, between two short words.
+    private static let pieced: [Piece] = [
+        word("ab", 10), space(5), word("cd", 10), word("_", 5), word("ef", 10), space(5),
+        word("gh", 10),
+    ]
+
+    @Test("A word the walk takes in part and drops bounds the line on neither side")
+    func droppedPieces() {
+        // At 32 the walk takes "cd" and "_" past the space and refuses "ef", so
+        // the line ends at the space: a narrower width that refuses "cd" or "_"
+        // ends it there too, and only 40, which takes the whole word, moves it.
+        let text = Self.text(Self.pieced)
+        let line = Self.lines(text, maxWidth: 32)[0]
+        #expect(line.end == LayoutCursor(segmentIndex: 2, graphemeIndex: 0))
+        #expect([line.bounds.fitted, line.bounds.refused] == [10, 40])
+        Self.expectExact(text, at: [9, 12, 26, 32, 39, 45, 100], "dropped pieces")
+        // Before a soft hyphen the reach is the hyphen's own fit, 38: at 36 the
+        // walk takes "cd" and "ef", refuses the hyphen and ends at the space.
+        let hyphenated = Self.text([
+            Self.word("ab", 10), Self.space(5), Self.word("cd", 10), Self.word("ef", 10),
+            Piece(text: "\u{AD}", kind: .softHyphen, width: 0, hyphen: 3), Self.word("gh", 10),
+        ])
+        let cut = Self.lines(hyphenated, maxWidth: 22)[0]
+        #expect([cut.bounds.fitted, cut.bounds.refused] == [10, 38])
+        Self.expectExact(hyphenated, at: [9, 22, 30, 36, 40, 100], "pieces before a hyphen")
+    }
+
+    @Test("Identifiers through the attributed prepare, in the pieces it leaves them")
+    func identifiers() {
+        let code = CTFontCreateWithName("Menlo" as CFString, 12, nil)
+        let fontKey = NSAttributedString.Key(kCTFontAttributeName as String)
+        let words = (0..<8).map { String(format: "w%02d_%05d", $0, 1) }
+        let source = NSAttributedString(
+            string: words.joined(separator: " "), attributes: [fontKey: code])
+        let text = prepareAttributed(source)
+        #expect(text.segmentCount > 2 * words.count - 1, "an identifier is several pieces")
+        Self.expectExact(text, at: [70, 100, 145, 150, 220, 290, 600], "identifiers")
     }
 
     // MARK: - The Bounds Themselves
