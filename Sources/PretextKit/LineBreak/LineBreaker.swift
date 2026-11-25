@@ -208,6 +208,14 @@ private func countChunkLines(_ core: PreparedCore, chunk: PreparedLineChunk, max
 
 // MARK: - Tab Advance
 
+/// The advance of a tab piece: from `lineW` to the next tab stop, or one
+/// whole stop when `lineW` stands on one. Zero when there is no stop.
+///
+/// Out of line, so that only a tab piece pays for the remainder, a call of
+/// `fmodf` on arm64. Inlined, it is arithmetic that the optimizer can compute
+/// for every piece of a line and select once the kind is known; a call that
+/// it cannot inline never runs ahead of the walkers' `kind == .tab` test.
+@inline(never)
 func getTabAdvance(lineW: Float, tabStopAdvance: Float) -> Float {
     guard tabStopAdvance > 0 else { return 0 }
     let remainder = lineW.truncatingRemainder(dividingBy: tabStopAdvance)
