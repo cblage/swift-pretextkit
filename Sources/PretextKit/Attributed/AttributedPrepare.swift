@@ -302,6 +302,10 @@ func prepareAttributed(
 /// `tabStopAdvance` overrides the prepare's eight-space tab stop for this
 /// line: a caller laying out a paragraph with its own tab interval passes
 /// it here, so the walk and the drawing agree on where a tab lands.
+///
+/// The line's `bounds` keep every comparison the walk made against
+/// `maxWidth`: `holds(atMaxWidth:)` tells whether a walk from the same start
+/// with the same tab stop returns the same line at another width.
 public func layoutNextLine(
     _ prepared: PreparedAttributedText,
     start: LayoutCursor,
@@ -317,7 +321,8 @@ public func layoutNextLine(
         result = LayoutLineRange(
             width: CGFloat(line.width),
             start: LayoutCursor(segmentIndex: line.startSegmentIndex, graphemeIndex: line.startGraphemeIndex),
-            end: LayoutCursor(segmentIndex: line.endSegmentIndex, graphemeIndex: line.endGraphemeIndex)
+            end: LayoutCursor(segmentIndex: line.endSegmentIndex, graphemeIndex: line.endGraphemeIndex),
+            bounds: line.bounds
         )
     }
     return result

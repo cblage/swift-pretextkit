@@ -63,6 +63,94 @@ public struct LayoutLineRange: Sendable {
     public let start: LayoutCursor
     /// Cursor position at the end of this line.
     public let end: LayoutCursor
+    /// The maximum widths at which a walk from `start` takes this line's path
+    /// again. The attributed `layoutNextLine` keeps them; `walkLineRanges`
+    /// keeps none, so its lines hold at no width.
+    public let bounds: LineWidthBounds
+
+    init(
+        width: CGFloat, start: LayoutCursor, end: LayoutCursor,
+        bounds: LineWidthBounds = .never
+    ) {
+        self.width = width
+        self.start = start
+        self.end = end
+        self.bounds = bounds
+    }
+
+    /// Whether a walk from `start` at `maxWidth` returns this line: every
+    /// comparison against the maximum width that made it gives the same answer
+    /// there.
+    public func holds(atMaxWidth maxWidth: CGFloat) -> Bool {
+        bounds.holds(atMaxWidth: maxWidth)
+    }
+}
+
+// MARK: - Line Width Bounds
+
+/// The maximum widths at which a line walk takes the same path. The walk reads
+/// the maximum width only to compare a value of its own path against it, with
+/// the line-fit epsilon, so it takes the same path at every maximum width at
+/// which each of its comparisons gives the answer it gave: `fitted` is the
+/// greatest value it found within the width, and `refused` the least value it
+/// found past it.
+public struct LineWidthBounds: Sendable, Equatable {
+    /// The greatest value a comparison found within the maximum width;
+    /// negative infinity when none did.
+    public private(set) var fitted: Float
+    /// The least value a comparison found past the maximum width; infinity
+    /// when none did.
+    public private(set) var refused: Float
+
+    init(fitted: Float, refused: Float) {
+        self.fitted = fitted
+        self.refused = refused
+    }
+
+    /// A walk that compared nothing: the same path at every maximum width.
+    public static let always = LineWidthBounds(fitted: -.infinity, refused: .infinity)
+
+    /// A walk whose comparisons were not kept: it holds at no maximum width.
+    public static let never = LineWidthBounds(fitted: .infinity, refused: -.infinity)
+
+    /// The bounds of walks made at one maximum width: they hold where each holds.
+    public func joined(with other: LineWidthBounds) -> LineWidthBounds {
+        LineWidthBounds(fitted: max(fitted, other.fitted), refused: min(refused, other.refused))
+    }
+
+    /// Whether every comparison gives the answer it gave at `maxWidth`, by the
+    /// walker's own arithmetic: a value fits when it is no greater than the
+    /// width with the line-fit epsilon added.
+    public func holds(atMaxWidth maxWidth: CGFloat) -> Bool {
+        let limit = Float(maxWidth) + lineFitEpsilon
+        return fitted <= limit && (refused == .infinity || limit < refused)
+    }
+
+    /// The walker's fit test, folded: whether `value` is no greater than the
+    /// maximum width with the line-fit epsilon added.
+    mutating func fits(_ value: Float, within maxWidth: Float) -> Bool {
+        let fits = value <= maxWidth + lineFitEpsilon
+        fold(value, fits: fits)
+        return fits
+    }
+
+    /// The walker's overflow test, folded: whether `value` is greater than the
+    /// maximum width with the line-fit epsilon added.
+    mutating func overflows(_ value: Float, past maxWidth: Float) -> Bool {
+        let overflows = value > maxWidth + lineFitEpsilon
+        fold(value, fits: !overflows)
+        return overflows
+    }
+
+    /// A value that fit raises `fitted`, and one that did not lowers `refused`.
+    /// A NaN answers the same at every width, and `max` and `min` pass over it.
+    private mutating func fold(_ value: Float, fits: Bool) {
+        if fits {
+            fitted = max(fitted, value)
+        } else {
+            refused = min(refused, value)
+        }
+    }
 }
 
 // MARK: - Layout Lines Result

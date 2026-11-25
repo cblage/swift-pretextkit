@@ -219,6 +219,12 @@ private func materializeLineText(
 /// (one at least), and a start cursor inside such a segment weighs only
 /// its remaining graphemes. `tabStopAdvance` overrides the core's when
 /// given.
+///
+/// The walk reads `maxWidth` only in its three tests, `overflows` for an
+/// overlong segment and for its graphemes and `fits` for each later segment,
+/// and each one it makes is folded into the line's `bounds`, so the line's
+/// path is the same at every maximum width at which they hold. The tab
+/// advance reads the line's width and the tab stop, never `maxWidth`.
 func walkSingleLine(
     _ core: PreparedCore,
     segments: [String],
@@ -235,6 +241,7 @@ func walkSingleLine(
     var hasContent = false
     var pendingBreakIndex = -1
     var pendingBreakPaintWidth: Float = 0
+    var bounds = LineWidthBounds.always
     let lineStart = start.segmentIndex
     let lineStartGrapheme = start.graphemeIndex
 
@@ -247,7 +254,8 @@ func walkSingleLine(
                 startGraphemeIndex: lineStartGrapheme,
                 endSegmentIndex: i + 1,
                 endGraphemeIndex: 0,
-                width: lineW
+                width: lineW,
+                bounds: bounds
             ))
             return
         }
@@ -268,13 +276,19 @@ func walkSingleLine(
             // An overlong segment breaks inside itself: the line ends at
             // the last grapheme that fits, and the next line starts
             // there. A segment whose remaining graphemes fit after all
-            // goes whole.
-            if advance > maxWidth + lineFitEpsilon, let graphemeWidths = core.breakableWidths[i] {
+            // goes whole. A segment with no grapheme widths goes whole at
+            // every width, and the first grapheme goes at every width, so
+            // neither compares itself against the width.
+            if let graphemeWidths = core.breakableWidths[i],
+                bounds.overflows(advance, past: maxWidth)
+            {
                 var fitted: Float = 0
                 var grapheme = graphemeStart
                 while grapheme < graphemeWidths.count {
                     let graphemeWidth = graphemeWidths[grapheme]
-                    if fitted + graphemeWidth > maxWidth + lineFitEpsilon, grapheme > graphemeStart {
+                    if grapheme > graphemeStart,
+                        bounds.overflows(fitted + graphemeWidth, past: maxWidth)
+                    {
                         break
                     }
                     fitted += graphemeWidth
@@ -286,7 +300,8 @@ func walkSingleLine(
                         startGraphemeIndex: lineStartGrapheme,
                         endSegmentIndex: i,
                         endGraphemeIndex: grapheme,
-                        width: fitted
+                        width: fitted,
+                        bounds: bounds
                     ))
                     return
                 }
@@ -301,7 +316,7 @@ func walkSingleLine(
         }
 
         let fitW = lineW + core.lineEndFitAdvances[i]
-        if fitW <= maxWidth + lineFitEpsilon {
+        if bounds.fits(fitW, within: maxWidth) {
             lineW += advance
             if kind.canBreakAfter {
                 pendingBreakIndex = i
@@ -320,7 +335,8 @@ func walkSingleLine(
                 startGraphemeIndex: lineStartGrapheme,
                 endSegmentIndex: endSeg,
                 endGraphemeIndex: 0,
-                width: paintW
+                width: paintW,
+                bounds: bounds
             ))
             return
         }
@@ -332,7 +348,8 @@ func walkSingleLine(
             startGraphemeIndex: lineStartGrapheme,
             endSegmentIndex: totalSegments,
             endGraphemeIndex: 0,
-            width: lineW
+            width: lineW,
+            bounds: bounds
         ))
     }
 }

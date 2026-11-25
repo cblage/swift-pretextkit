@@ -11,6 +11,9 @@ struct InternalLayoutLine {
     var endSegmentIndex: Int
     var endGraphemeIndex: Int
     var width: Float
+    /// The comparisons against the maximum width that made the line, where its
+    /// walker keeps them (`walkSingleLine`); `never` from the chunk walker.
+    var bounds: LineWidthBounds = .never
 }
 
 // MARK: - Simple Line Counter (Fast Path)
